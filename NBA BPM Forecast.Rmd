@@ -1,0 +1,488 @@
+My proposal is centred around estimating the performance (Box +/-) of NBA players using a hierarchical regression model considering age and team.
+
+All required packages for data processing, plotting and regression respectively:
+```{r}
+
+#install.packages(("bayesplot")
+#install.packages("rstanarm")
+library("dplyr")
+library("rvest")
+library("ggplot2")
+library("patchwork")
+library("lme4")
+library("bayesplot")
+library("rstanarm")
+
+```
+
+Function to load all player data from 2004-05 season. We will scrape the basketball-reference website for statistics.
+```{r}
+
+seasons <- 2005:2025                                # data since 2004-05 
+
+# using rvest to gather data from the basketball-reference website
+get_per36 <- function(year) {
+  Sys.sleep(runif(1, 4, 8))                         # don't get blocked by basketball-reference!
+  url <- paste0("https://www.basketball-reference.com/leagues/NBA_",year,"_per_minute.html") # url for per36 statistics
+  
+  df <- read_html(url) %>%
+    html_element("table#per_minute_stats") %>%      # table name in html is 'per_minute_stats'
+    html_table(fill = TRUE) %>%
+    filter(Player != "Player") %>%                  # website repeats headers further down the page giving a row: Player | Team | etc. that we 
+    mutate(                                         # don't want to consider
+      player = Player,
+      season = year,
+      team = Team,
+      age = Age,  
+      minutes = MP,
+     ) %>%
+    select(player, age, team, season, minutes)
+    
+    return(df)
+}
+
+```
+
+Next, we create a function to scrape basketball-reference for ages and BPM:
+```{r}
+
+get_BPM <- function(year, data) {
+   Sys.sleep(runif(1, 4, 7))
+  url <- paste0("https://www.basketball-reference.com/leagues/NBA_",year,"_advanced.html") # url for advanced statistics like BPM
+  
+  df <- read_html(url) %>%
+    html_element("table#advanced") %>%
+    html_table(fill = TRUE) %>%
+    filter(Player != "Player") %>%
+    mutate(
+      player = Player,                              # relevant rows for us to join the data
+      age = Age,
+      team = Team,
+      BPM = as.numeric(BPM)
+    ) %>% 
+    select(player, age, team, BPM)
+  
+    return(df)
+}
+
+```
+
+Create and join the datasets. We filter for players with at least 400 minutes in a season:
+```{r}
+
+per36_stats <- bind_rows(lapply(seasons, get_per36))           # map_df() from purr applies our function over every year in seasons
+bpm_stats <- bind_rows(lapply(seasons, get_BPM))
+
+player_stats05 <- inner_join(per36_stats, bpm_stats, by = c("player", "age", "team"))
+
+player_stats05 <- player_stats05 %>%
+  filter(minutes >= 400) %>%
+  filter(!(team %in% c("2TM", "3TM", "4TM", "5TM"))) %>% # remove season averages/totals for players who were on multiple teams
+  mutate(team = case_when(
+    team == "NJN" ~ "BRK",                          # New Jersey -> Brooklyn Nets, New Orleans Hornets became the Pelicans
+    team == "NOH" ~ "NOP",
+    team == "CHO" ~ "CHA",
+    TRUE ~ team),
+    player = as.factor(player),
+    team = as.factor(team),
+    season = as.factor(season),
+    a1 = age - mean(age),               # useful for clean modelling of intercept and coefficients, 
+    a2 = a1^2,                          # especially with polynomial terms
+)
+
+summary(player_stats05)
+
+```
+
+First, how age affects BPM, and how many minutes a player gets:
+```{r}
+
+theme_grid <- theme_minimal() + 
+  theme(panel.grid.major = element_line(colour = "grey", linewidth = 0.6),
+        panel.grid.minor = element_line(colour = "grey", linewidth = 0.2))
+
+# population histogram
+ggplot(player_stats05, aes(x = BPM)) +
+  geom_histogram(binwidth = 1, fill = "red") +
+  labs(title = "Population Histogram for BPM in the NBA 2004-2025") +
+  theme_grid
+
+# population scatter plot
+age_bpm1 <- ggplot(player_stats05, aes(x = age, y = BPM)) +
+  geom_point() +
+  geom_smooth(method = "loess") +
+  labs(title = "BPM vs. Age") +
+  theme_grid 
+
+age_bpm2 <- ggplot(player_stats05, aes(x = a1, y = BPM)) +
+  geom_point() +
+  geom_smooth(method = "loess") +
+  labs(title = "BPM vs. Centred Age",
+       x = "Centred Age") +
+  theme_grid
+
+# minutes plot
+ggplot(player_stats05, aes(x = age, y = minutes)) +
+  geom_point() +
+  geom_smooth(method = "loess")
+
+age_bpm1  
+age_bpm1 + age_bpm2
+
+```
+The histogram show a mode around -1 BPM, but the data has a slight right skew, as there are more extreme positive values: Gamma distribution shifted left?
+Looking at samples, BPM increases with age until a player is around 27, then it declines until ~35. BPM sometimes picks up slightly past 35.
+
+
+Histograms for specific ages:
+```{r}
+
+hist_age_bpm <- function(age) {
+  ggplot(player_stats05[player_stats05$age == age, ], aes(x = BPM)) +
+    geom_histogram(binwidth = 1, fill = "blue") +
+    labs(title = paste(age, "Year Old Players")) +
+    theme_grid
+}
+
+h20 <- hist_age_bpm(20)
+h23 <- hist_age_bpm(23)
+h27 <- hist_age_bpm(27)
+h30 <- hist_age_bpm(30)
+hist_age_bpm(34)
+
+h20 + h23 + h27 + h30
+
+```
+
+
+Season and team plots:
+```{r}
+
+# season plot
+ggplot(player_stats05, aes(x = factor(season), y = BPM)) +
+  geom_boxplot() +
+  labs(title = "BPM by Season",
+       x = "Season") +
+  coord_cartesian(ylim = c(-6, 6))
+
+# team plot overall
+tm_ov <- ggplot(player_stats05, aes(x = factor(team), y = BPM)) +
+  geom_boxplot() +
+  labs(title = "2004-25 BPM by Team",
+       x = "Team") +
+  coord_cartesian(ylim = c(-10, 10)) +
+  theme_grid +
+  theme(axis.text.x = element_text(angle = 90)) 
+  
+
+# function for comparing within seasons
+plot_team_bpm <- function(year) {
+  ggplot(player_stats05[player_stats05$season == year, ], aes(x = factor(team), y = BPM)) +
+  geom_boxplot() +
+  labs(title = paste0(year-1, "-", year," BPM by Team"),
+       x = "Team") +
+  coord_cartesian(ylim = c(-6, 6)) +
+  theme(axis.text.x = element_text(angle = 90)) + 
+  theme_grid +
+  theme(axis.text.x = element_text(angle = 90))
+}
+
+# 2015-16 team plot
+tm_15 <- plot_team_bpm(2015)
+tm_20 <- plot_team_bpm(2020)
+tm_25 <- plot_team_bpm(2025)
+
+tm_ov
+tm_25
+tm_ov + tm_15 + tm_20 + tm_25
+
+```
+Regarding seasons, the mean and quartiles are generally similar, no clear improvement by season. Clearly some teams have worse players on average - the Charlotte Hornets average -2.5 BPM players, contrasting with the Spurs averaging 0. We can see that variance is much higher for individual years, with 2024 Celtics averaging 1 BPM and Trailblazers -3. Indicating that the specific season matters for each team.
+
+
+Let's look at some specific players:
+```{r}
+
+plot_player_bpm <- function (player) {
+  ggplot(player_stats05[player_stats05$player == player, ], aes(x = age, y = BPM)) +
+  geom_point() +
+  geom_smooth(method = "loess", se = FALSE, color = "blue") +
+  labs(title = player,
+         x = "Age") +
+  coord_cartesian(xlim = c(18, 42), ylim = c(-2, 12)) +
+  theme_grid
+}
+
+lbj <- plot_player_bpm("LeBron James")
+tys <- plot_player_bpm("Tyson Chandler")
+car <- plot_player_bpm("Alex Caruso")
+jok <- plot_player_bpm("Nikola Jokić")
+rud <- plot_player_bpm("Rudy Gobert")
+kaw <- plot_player_bpm("Kawhi Leonard")
+ram <- plot_player_bpm("Ramon Sessions")
+har <- plot_player_bpm("James Harden")
+plot_player_bpm("Zach LaVine")
+
+lbj + tys + kaw + car
+jok + rud + har + ram
+```
+Everyone has different trajectories! Though we can find some patterns between players.
+
+
+Let's try BPM-age distribution within teams:
+```{r}
+
+plot_inteam_bpm <- function(team) {
+  ggplot(player_stats05[player_stats05$team == team, ], aes(x = age, y = BPM)) +
+  geom_point() +
+  geom_smooth(method = "loess", color = "blue") +
+  labs(title = paste(team, "average BPM by player age"),
+         x = "Age") +
+  coord_cartesian(xlim = c(18, 42), ylim = c(-3, 12)) +
+  theme_grid
+}
+
+LAL <- plot_inteam_bpm("LAL")
+SAS <- plot_inteam_bpm("SAS")
+OKC <- plot_inteam_bpm("OKC")
+MEM <- plot_inteam_bpm("MEM")
+CLE <- plot_inteam_bpm("CLE")
+GSW <- plot_inteam_bpm("GSW")
+BOS <- plot_inteam_bpm("BOS")
+TOR <- plot_inteam_bpm("TOR")
+plot_inteam_bpm("UTA")
+
+LAL + GSW + SAS  + BOS
+TOR  + CLE  + OKC + MEM
+```
+Age has differing effects based on team, one way to think of this is that star players will go to big market teams like the Lakers or Warriors to retire. Also, they might want to go to California! Some teams like OKC and Memphis have bring up great young talents, while teams like the Bulls are characterised by having poorly performing older players.
+
+
+Given what we've seen, we define our formula and experiment with prior distributions for coefficients:
+
+Age is clearly a useful indicator for predicting BPM, though it has vastly different effects on each individual. Therefore, we will model the effect of age as ~ age = population_effect(age) + individual_effect(age), where the population effect is a polynomial (since it increases, then decreases, then begins to flatten out), and the nested effect of age for each individual is random, varying from the global average.
+
+Season itself has little effect and neither does team over a long period. However, within each season, each time has vastly different average BPM, despite it being regularised (to some extent) based on team performance. Therefore, we will include a random intercept for each team (for example, Lakers sign stars), as well as an interaction between the two to represent randomness across seasons.
+
+
+Initial, single level OLS model:
+```{r}
+
+lsmod <- lm(BPM ~ log(a1 + 9) + log(a2) + season * team, 
+                data = player_stats05)
+
+summary(lsmod)
+
+plot(lsmod)
+
+# age against residual, we see that there are large residuals for players below 30 (often players at their peak).
+ggplot(player_stats05, aes(x = age, y = resid(lsmod))) +
+  geom_point(alpha = 0.5) +
+  geom_hline(yintercept = 0, colour = "red", linetype = "dashed") +
+  labs(title = "Residuals vs. Age") 
+
+```
+The issue with this model is it doesn't understand the existence of elite players as the Q-Q plot demonstrates, it takes an average and doesn't account for the variance in individual player trajectories.
+
+
+A frequentist, multi-level model:
+```{r}
+
+lhmod <- lmer(BPM ~ log(a1 + 9) + log(a2) + (log(a1 + 9) + log(a2) | player) + (1 | team / season),
+                 data = player_stats05)
+
+summary(lhmod)
+
+plot(lsmod)
+
+plot(lhmod)
+qqnorm(resid(lhmod), main = "Q-Q Plot (Multi-Level)")
+abline(0, 1, col = "red", lwd = 0.5, linetype = 2)
+```
+Already, this simple model with random intercepts looks better, we use a random effect for each season, each team and each player, while maintaining the polynomial representation of the population effect of age. Residuals are better distributed - a range of -6 to 6 instead of -7 to 14, but they are still quite large. The distribution can also be seen by the more normal Q-Q plot.
+
+
+Hierarchical Bayesian model, we use Markov Chain Monte Carlo to simulate the posterior distributions. First we decide on priors:
+```{r}
+
+seasons_bhmod <- seasons[seq(1, length(seasons), 2)]  # sample for quicker prior checks
+
+
+player_stats_bhmod <- player_stats05 %>%
+  filter(season %in% seasons_bhmod)
+
+# a plot to determine our priors for fixed effect of age and intercept
+age_pr1 <- ggplot(player_stats_bhmod, aes(x = a1, y = log(a1+9) * 0.8 - 0.2 * log(a2) - 1.8)) +     # +9 so that we can model 18 y. olds
+  geom_point() +
+  geom_line(colour = "blue") +
+  coord_cartesian(ylim = c(-10,15)) +
+  theme_grid +
+  labs(title = "Age effect formula vs. Age",
+       x = "Centred Age")
+
+# without axis scaling
+ggplot(player_stats_bhmod, aes(x = a1, y = log(a1 + 9) * 0.8 - 0.2 * log(a2) - 1.8 )) +
+  geom_point() +
+  theme_grid
+
+age_pr1
+age_pr1 + age_bpm2
+
+```
+
+```{r}
+# runs in 3 minutes or so
+bhmod_prior <- stan_glmer(
+  BPM ~ log(a1 + 9) + log(a2)  + (log(a1 + 9) + log(a2) | player) + (1 | team),
+  family = gaussian(),
+  data = player_stats_bhmod,                    
+  prior = normal(
+    location = c(0.8, -0.2),                         # Priors determined above and using reasonable variance
+    scale = c(0.2, 0.02),      
+    autoscale = FALSE),
+  prior_intercept = normal(-1.8, 2),                 # Prior for the intercept (note that this is around age 27)
+  prior_aux = normal(1, 0.5, autoscale = FALSE),     # Prior for noise: uninformative
+  prior_covariance = decov(regularization = 1.2),    # Americans...                        
+  prior_PD = TRUE,      # ^cov prior: allow deviation, but still fairly strict with shrinkage if there's a lack of data  
+  iter = 2000, chains = 4,
+  cores = 8)                                         # We're going to need some power!
+
+pp_check(bhmod_prior)
+
+```
+Possible distributions drawn from MCMC using our defined priors follow (somewhat loosely) the true distribution, this model will give us reasonable estimates, let's try it.
+
+
+Bayesian prediction for players in sample:
+```{r}
+
+# so that we have some out of sample data to test on (2004-2009)
+model_stats10 <- player_stats05 %>%
+  filter(as.numeric(as.character(season)) >= 2010)
+
+# the final model developed above, runs in an hour or so
+bhmod <- stan_glmer(
+  BPM ~ log(a1 + 9) + log(a2)  + (1 + log(a1 + 9) + log(a2) | player) + (1 | team),
+  family = gaussian(),
+  data = model_stats10,                    
+  prior = normal(
+    location = c(0.8, -0.2),                       
+    scale = c(0.1, 0.03),      
+    autoscale = FALSE),
+  prior_intercept = normal(-1.8, 2),                  
+  prior_aux = normal(1, 1, autoscale = FALSE),         
+  prior_covariance = decov(regularization = 1.2),                            
+  iter = 5000, chains = 4, control = list(adapt_delta = 0.98),  # smaller steps to avoid divergence                      
+  cores = 8)             
+
+summary(bhmod)
+pp_check(bhmod)
+
+qq_preds <- posterior_linpred(bhmod, transform = TRUE)  
+qq_mean <- colMeans(qq_preds)
+
+# Q-Q plot 
+qqplot(qq_mean, bhmod$y,
+       main = "Q-Q Plot (Bayesian Hierarchical)",
+       xlab = "Predicted Quantiles",
+       ylab = "Observed Quantiles",
+       pch = 19, col = "darkblue") 
+abline(0, 1, col = "red", lwd = 0.5)
+
+```
+
+SHINYSTAN
+```{r}
+
+#library("shinystan")
+#launch_shinystan(bhmod)
+
+```
+
+
+
+These models use a normal family for the presumed distribution of BPM, we know that BPM is mean ~0, but distributed around -1.
+
+
+Let's see how our model performs for specific players, recalling that seasons 2005, 06, 07, 08 and 09 were not in the model:
+```{r}
+
+plot_model_bpm <- function(player, data = player_stats05,  max_year = 2025) {
+  preds <- posterior_epred(bhmod, data[data$player == player, ] %>%
+                             select(-BPM))              # can remove as posterior is decided
+                                                        # will be useful for future prediction (no NAs)
+  predictions <- data[data$player== player, ] %>%
+    mutate(mean = colMeans(preds),                            # average prediction
+           lower = apply(preds, 2, quantile, probs = 0.025),  # 95% confidence interval
+           upper = apply(preds, 2, quantile, probs = 0.975)) 
+ 
+  ggplot(predictions, aes(x = age)) +
+    # true
+    geom_point(aes(y = BPM)) +
+    geom_smooth(aes(y = BPM), method = "loess", se = FALSE, color = "blue") +
+    
+    # model
+    geom_point(aes(y = mean), colour = "purple") + 
+    geom_line(aes(y = mean), colour = "red") +
+    geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.2) +
+    
+    coord_cartesian(xlim = c(18, 45), ylim = c(-2, 14))  +
+    theme_grid +
+    labs(title = paste("Modelled & True BPM for", player),
+         x = "Age", y = "BPM") 
+    
+}
+
+a <- plot_model_bpm("LeBron James")
+b <- plot_model_bpm("Stephen Curry")
+c <- plot_model_bpm("Kawhi Leonard")
+d <- plot_model_bpm("Al Horford")
+
+plot_model_bpm("Nikola Jokić")
+plot_model_bpm("Mike Bibby")  
+
+a+b+c+d
+```
+
+Finally, forecasting the next few years:
+```{r}
+
+player_stats_future <- player_stats05 %>%
+  select(player, age, team, season, BPM, a1, a2)
+
+add_years <- function(player, team, years) {
+  df <- player_stats05 %>%
+    filter(player == !!player) %>%
+    mutate(season = as.numeric(as.character(season))) 
+    
+  last_age <- max(df$age)
+  last_yr <- max(df$season)
+ 
+  future.dat <- tibble(
+    player = player,
+    team = team,
+    season = seq(last_yr + 1, last_yr + years),
+    age = seq(last_age + 1, last_age + years)) %>%
+    mutate(
+      season = factor(season), 
+      a1 = age - mean(player_stats05$age),  
+      a2 = a1^2)
+  
+  player_stats_future <- bind_rows(future.dat, player_stats_future)
+  return(player_stats_future)
+}
+
+player_stats_future <- add_years("LeBron James", "LAL", 5)
+player_stats_future <- add_years("Nikola Jokić", "DEN", 5)
+player_stats_future <- add_years("Kawhi Leonard", "TOR", 3)
+player_stats_future <- add_years("Kyrie Irving", "CLE", 5)
+player_stats_future <- add_years("Shai Gilgeous-Alexander", "OKC", 10)
+
+aa <- plot_model_bpm("LeBron James", player_stats_future, 2030)
+ab <- plot_model_bpm("Nikola Jokić", player_stats_future, 2030)
+ac <- plot_model_bpm("Kyrie Irving", player_stats_future, 2030)
+ad <- plot_model_bpm("Shai Gilgeous-Alexander", player_stats_future, 2035)
+plot_model_bpm("Kawhi Leonard", player_stats_future, 2028)
+
+aa + ab + ac + ad
+```
